@@ -3,8 +3,8 @@ class LaughAtYourselfApp {
         this.isRecording = false;
         this.mediaRecorder = null;
         this.audioChunks = [];
-        this.conversationHistory = this.loadConversationHistory();
-        this.voiceSample = null;
+        this.conversationHistory = this.loadConversationHistory(); // Entries will now include audio
+        this.voiceSample = null; // Stores base64 data URL of user's voice for cloning
         this.userSpeakingStyle = this.loadSpeakingStyle();
         this.maxRetries = 3;
         this.baseRetryDelay = 1000; // 1 second
@@ -25,6 +25,7 @@ class LaughAtYourselfApp {
         this.loadingOverlay = document.getElementById('loadingOverlay');
         this.loadingText = document.getElementById('loadingText');
         this.clearHistoryBtn = document.getElementById('clearHistory');
+        this.downloadConversationBtn = document.getElementById('downloadConversationBtn'); // New button
         this.conversationCountEl = document.getElementById('conversationCount');
         this.audioVisualizer = document.getElementById('audioVisualizer');
         this.liveTranscription = document.getElementById('liveTranscription');
@@ -37,6 +38,7 @@ class LaughAtYourselfApp {
     setupEventListeners() {
         this.recordBtn.addEventListener('click', () => this.toggleRecording());
         this.clearHistoryBtn.addEventListener('click', () => this.clearHistory());
+        this.downloadConversationBtn.addEventListener('click', () => this.downloadConversation()); // Listener for download
         this.acceptConsentBtn.addEventListener('click', () => this.handleConsentAccept());
         this.declineConsentBtn.addEventListener('click', () => this.handleConsentDecline());
     }
@@ -182,13 +184,13 @@ class LaughAtYourselfApp {
 
     async processRecording() {
         this.showLoading();
+        const audioBlob = new Blob(this.audioChunks, { type: 'audio/wav' });
         
         try {
-            // Step 1: Convert audio to text
+            // Step 1: Convert audio to text (using live transcription result)
             this.setLoadingStep(1);
-            const audioBlob = new Blob(this.audioChunks, { type: 'audio/wav' });
             const transcription = await this.retryWithBackoff(
-                () => this.transcribeAudio(audioBlob)
+                () => this.transcribeAudio(audioBlob) // audioBlob not directly used if live transcript good
             );
             
             if (!transcription.trim()) {
@@ -208,12 +210,11 @@ class LaughAtYourselfApp {
             
             // Step 3: Generate voice clone and play
             this.setLoadingStep(3);
-            await this.retryWithBackoff(
-                () => this.speakResponse(aiResponse, audioBlob)
-            );
+            // This method now handles TTS call, playback, and returns the URL
+            const aiAudioUrl = await this.getAndPlayTTSAudio(aiResponse, audioBlob); 
             
-            // Update conversation history and learning
-            this.updateConversationHistory(transcription, aiResponse);
+            // Update conversation history with audio data
+            this.updateConversationHistory(transcription, audioBlob, aiResponse, aiAudioUrl);
             this.updateSpeakingStyle(transcription);
             
         } catch (error) {
@@ -224,7 +225,10 @@ class LaughAtYourselfApp {
                 errorMessage += 'Network connection issue. Please check your internet and try again.';
             } else if (error.message.includes('quota') || error.message.includes('limit')) {
                 errorMessage += 'Service temporarily unavailable. Please try again in a moment.';
-            } else {
+            } else if (error.message.includes('Text-to-speech service unavailable')) {
+                 errorMessage += 'Could not generate AI voice at this time. Please try again.';
+            }
+            else {
                 errorMessage += 'Please try again.';
             }
             
@@ -273,73 +277,82 @@ class LaughAtYourselfApp {
         }
     }
 
-    async speakResponse(text, userVoiceSample) {
-        try {
-            let voiceOptions = { text };
-            
-            if (this.voiceSample) {
-                // Use the stored voice sample for consistency
-                voiceOptions.voice_sample = this.voiceSample;
-            } else if (userVoiceSample) {
-                // Convert blob to data URL for voice cloning
-                try {
-                    const arrayBuffer = await userVoiceSample.arrayBuffer();
-                    const uint8Array = new Uint8Array(arrayBuffer);
-                    const base64 = btoa(String.fromCharCode.apply(null, uint8Array));
-                    const dataUrl = `data:audio/wav;base64,${base64}`;
-                    
-                    voiceOptions.voice_sample = dataUrl;
-                    this.voiceSample = dataUrl; // Store for future use
-                } catch (voiceError) {
-                    console.warn('Failed to process voice sample, using default voice:', voiceError);
-                    voiceOptions.voice = 'en-male';
-                }
-            } else {
-                // Fallback to default voice
-                voiceOptions.voice = 'en-male';
-            }
+    async getAndPlayTTSAudio(text, userVoiceSampleBlob) {
+        let voiceOptions = { text };
+        let ttsResult;
 
-            const result = await websim.textToSpeech(voiceOptions);
-            
-            // Play the audio with error handling
-            const audio = new Audio(result.url);
-            
-            return new Promise((resolve, reject) => {
-                audio.onloadeddata = () => {
-                    audio.play().then(resolve).catch(reject);
-                };
-                audio.onerror = () => {
-                    reject(new Error('Failed to load audio'));
-                };
-                audio.onended = resolve;
-            });
-            
-        } catch (error) {
-            console.error('Error generating speech:', error);
-            
-            // Enhanced fallback handling
+        const attemptTTS = async (options) => {
+            // Simplified retry as websim itself might have retries.
+            // For more complex retry logic (e.g. specific error codes), expand this.
+            return websim.textToSpeech(options);
+        };
+    
+        // Priority: 1. Cached voice sample, 2. Current recording, 3. Default voice
+        if (this.voiceSample) {
+            voiceOptions.voice_sample = this.voiceSample;
+        } else if (userVoiceSampleBlob && userVoiceSampleBlob.size > 0) {
             try {
-                console.log('Attempting fallback to default voice...');
-                const result = await websim.textToSpeech({
-                    text: text,
-                    voice: 'en-male'
-                });
+                const arrayBuffer = await userVoiceSampleBlob.arrayBuffer();
+                const uint8Array = new Uint8Array(arrayBuffer);
+                const base64 = btoa(String.fromCharCode.apply(null, uint8Array));
+                const dataUrl = `data:audio/wav;base64,${base64}`;
                 
-                const audio = new Audio(result.url);
-                return new Promise((resolve, reject) => {
-                    audio.onloadeddata = () => {
-                        audio.play().then(resolve).catch(reject);
-                    };
-                    audio.onerror = () => {
-                        reject(new Error('Failed to load fallback audio'));
-                    };
-                    audio.onended = resolve;
-                });
-            } catch (fallbackError) {
-                console.error('Fallback voice also failed:', fallbackError);
-                throw new Error('Text-to-speech service unavailable');
+                voiceOptions.voice_sample = dataUrl;
+                this.voiceSample = dataUrl; // Cache for future use
+            } catch (voiceError) {
+                console.warn('Failed to process user voice sample for cloning, will use default voice:', voiceError);
+                // Fall through to use default voice if voice_sample couldn't be set
             }
         }
+    
+        try {
+            if (voiceOptions.voice_sample) {
+                // Try with voice sample first
+                 ttsResult = await this.retryWithBackoff(() => attemptTTS(voiceOptions), 2, 500); // Fewer retries for custom voice
+            } else {
+                // If no voice sample, use default voice directly
+                voiceOptions.voice = 'en-male';
+                ttsResult = await this.retryWithBackoff(() => attemptTTS(voiceOptions));
+            }
+        } catch (error) {
+            console.warn('TTS with preferred voice failed, attempting fallback to default voice:', error);
+            try {
+                // Explicit fallback to default voice
+                const fallbackOptions = { text, voice: 'en-male' };
+                ttsResult = await this.retryWithBackoff(() => attemptTTS(fallbackOptions));
+            } catch (fallbackError) {
+                console.error('TTS fallback to default voice also failed:', fallbackError);
+                throw new Error('Text-to-speech service unavailable after fallback.');
+            }
+        }
+    
+        if (!ttsResult || !ttsResult.url) {
+            throw new Error('Text-to-speech service did not return a valid audio URL.');
+        }
+    
+        const audioUrl = ttsResult.url;
+        const audio = new Audio(audioUrl);
+        
+        await new Promise((resolve, reject) => {
+            audio.onloadeddata = () => {
+                audio.play().then(resolve).catch(e => {
+                    console.error("Error playing audio:", e);
+                    reject(new Error('Playback failed: ' + e.message));
+                });
+            };
+            audio.onerror = (e) => {
+                // e is an Event, e.target.error might have more details
+                console.error("Error loading audio:", e);
+                let errorMsg = 'Failed to load audio for playback.';
+                if (e.target && e.target.error && e.target.error.message) {
+                    errorMsg += ` Details: ${e.target.error.message}`;
+                }
+                reject(new Error(errorMsg));
+            };
+            audio.onended = resolve; // Resolve when playback finishes
+        });
+    
+        return audioUrl; // Return the URL for history and download
     }
 
     addMessage(type, content) {
@@ -396,13 +409,13 @@ class LaughAtYourselfApp {
         }
     }
 
-    updateConversationHistory(userMessage, aiMessage) {
+    updateConversationHistory(userMessage, userAudioBlob, aiMessage, aiAudioUrl) {
         this.conversationHistory.push(
-            { role: 'user', content: userMessage },
-            { role: 'assistant', content: aiMessage }
+            { role: 'user', content: userMessage, audio: userAudioBlob },
+            { role: 'assistant', content: aiMessage, audio: aiAudioUrl } // Store URL for AI audio
         );
         
-        // Keep only last 20 messages for performance
+        // Keep only last 20 messages (10 pairs) for performance in UI and storage
         if (this.conversationHistory.length > 20) {
             this.conversationHistory = this.conversationHistory.slice(-20);
         }
@@ -449,14 +462,15 @@ class LaughAtYourselfApp {
     clearHistory() {
         this.conversationHistory = [];
         this.userSpeakingStyle = { commonWords: {}, phrases: {} };
-        this.voiceSample = null;
+        this.voiceSample = null; // Clear cached voice sample
         
         this.saveConversationHistory();
         this.saveSpeakingStyle();
+        localStorage.removeItem('laughAtYourselfVoiceSample'); // Also clear any persistent sample if used
         
         this.messageContainer.innerHTML = `
             <div class="welcome-message">
-                <p>😄 Ready for a good laugh? Hit that mic and say something!</p>
+                <p> Ready for a good laugh? Hit that mic and say something!</p>
             </div>
         `;
         
@@ -484,6 +498,105 @@ class LaughAtYourselfApp {
 
     saveSpeakingStyle() {
         localStorage.setItem('laughAtYourselfStyle', JSON.stringify(this.userSpeakingStyle));
+    }
+
+    async downloadConversation() {
+        if (this.conversationHistory.length === 0) {
+            alert("Nothing to download! Start a conversation first.");
+            return;
+        }
+
+        this.showLoading(); // Show loading overlay during zipping
+        this.loadingText.textContent = "Zipping your laughs...";
+        document.querySelectorAll('.step').forEach(s => s.style.display = 'none');
+
+
+        const zip = new JSZip(); // Ensure JSZip is loaded via <script> tag
+        let messageIndex = 0; // To number messages 1, 2, 3... for paired entries
+
+        // Add a readme file
+        zip.file("conversation_readme.txt", 
+            "Laugh At Yourself! - Conversation Archive\n\n" +
+            "This archive contains your conversation with the AI comedian.\n" +
+            "Files are named with a message index and role (user/ai).\n" +
+            "Each message includes:\n" +
+            "  - A text file (.txt) with the transcribed/generated text.\n" +
+            "  - An audio file (.wav for user, .mp3 or .wav for AI) with the recorded/generated speech.\n\n" +
+            "Enjoy reliving the giggles! "
+        );
+
+        for (let i = 0; i < this.conversationHistory.length; i++) {
+            const entry = this.conversationHistory[i];
+            
+            // Increment messageIndex for user messages, as they start a pair
+            if (entry.role === 'user') {
+                messageIndex++;
+            }
+            
+            const paddedIndex = String(messageIndex).padStart(3, '0');
+            const prefix = `message_${paddedIndex}_${entry.role}`;
+
+            // Add text content
+            zip.file(`${prefix}_text.txt`, entry.content);
+
+            // Add audio content
+            if (entry.audio) {
+                let audioBlob;
+                let audioExtension = 'wav'; // Default for user audio
+
+                if (entry.role === 'user' && entry.audio instanceof Blob) {
+                    audioBlob = entry.audio;
+                } else if (entry.role === 'assistant' && typeof entry.audio === 'string') { // AI audio is a URL
+                    try {
+                        this.loadingText.textContent = `Fetching AI audio ${messageIndex}...`;
+                        const response = await fetch(entry.audio);
+                        if (!response.ok) throw new Error(`Failed to fetch AI audio: ${response.statusText} (URL: ${entry.audio})`);
+                        audioBlob = await response.blob();
+                        
+                        const urlPath = new URL(entry.audio).pathname;
+                        const extFromUrl = urlPath.substring(urlPath.lastIndexOf('.') + 1);
+                        if (['mp3', 'wav', 'ogg', 'aac', 'm4a'].includes(extFromUrl.toLowerCase())) {
+                             audioExtension = extFromUrl.toLowerCase();
+                        } else if (audioBlob.type && audioBlob.type.startsWith('audio/')) {
+                             audioExtension = audioBlob.type.split('/')[1];
+                             if (audioExtension === 'mpeg') audioExtension = 'mp3'; // common case
+                        } else {
+                            audioExtension = 'mp3'; // Fallback for AI audio extension
+                        }
+                    } catch (error) {
+                        console.error(`Failed to fetch audio for ${prefix}:`, error);
+                        zip.file(`${prefix}_audio_FETCH_ERROR.txt`, `Error fetching audio: ${error.message}\nURL: ${entry.audio}`);
+                        continue; 
+                    }
+                }
+
+                if (audioBlob) {
+                    zip.file(`${prefix}_audio.${audioExtension}`, audioBlob);
+                }
+            }
+        }
+
+        try {
+            this.loadingText.textContent = "Generating ZIP file...";
+            const zipBlob = await zip.generateAsync({ type: "blob" }, (metadata) => {
+                this.loadingText.textContent = `Compressing... ${metadata.percent.toFixed(0)}%`;
+            });
+            
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(zipBlob);
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            link.download = `laugh_at_yourself_conversation_${timestamp}.zip`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(link.href);
+        } catch (error) {
+            console.error("Error generating zip file:", error);
+            alert("Failed to generate download. See console for details.");
+        } finally {
+            this.hideLoading();
+            document.querySelectorAll('.step').forEach(s => s.style.display = 'block'); // Restore step display
+        }
     }
 
     startLiveTranscription() {
