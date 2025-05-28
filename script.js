@@ -12,6 +12,34 @@ class LaughAtYourselfApp {
         this.finalTranscript = '';
         this.lastInterimTranscript = '';
 
+        // Define CORS proxies
+        this.corsProxies = [
+            { 
+                name: 'CodeTabs',
+                buildUrl: (targetUrl) => `https://api.codetabs.com/v1/proxy/?quest=${targetUrl}` 
+                // Note: targetUrl should NOT be encoded for codetabs quest parameter
+            },
+            { 
+                name: 'CORSProxy.io',
+                buildUrl: (targetUrl) => `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
+            },
+            { 
+                name: 'AllOrigins',
+                buildUrl: (targetUrl) => `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`
+            },
+            {
+                name: 'ProxyCors.sh',
+                // Prepends the proxy, targetUrl should be a full URL.
+                buildUrl: (targetUrl) => `https://proxy.cors.sh/${targetUrl}`
+            },
+            {
+                name: 'ThingProxy',
+                // Prepends the proxy, targetUrl should be a full URL.
+                buildUrl: (targetUrl) => `https://thingproxy.freeboard.io/fetch/${targetUrl}`
+            }
+        ];
+
+
         this.initializeElements();
         this.checkConsentStatus();
         this.setupEventListeners();
@@ -543,34 +571,86 @@ class LaughAtYourselfApp {
             if (entry.audio) {
                 let audioBlob;
                 let audioExtension = 'wav'; // Default for user audio
+                let successfullyFetchedAudio = false;
 
                 if (entry.role === 'user' && entry.audio instanceof Blob) {
                     audioBlob = entry.audio;
+                    successfullyFetchedAudio = true;
                 } else if (entry.role === 'assistant' && typeof entry.audio === 'string') { // AI audio is a URL
-                    try {
-                        this.loadingText.textContent = `Fetching AI audio ${messageIndex}...`;
-                        const response = await fetch(entry.audio); // Fetch from the stored URL
-                        if (!response.ok) throw new Error(`Failed to fetch AI audio: ${response.statusText} (URL: ${entry.audio})`);
-                        audioBlob = await response.blob();
+                    const audioUrlToFetch = entry.audio;
+                    console.log(`Attempting to fetch AI audio: ${audioUrlToFetch}`);
+
+                    // Try CORS proxies
+                    for (let proxyIndex = 0; proxyIndex < this.corsProxies.length; proxyIndex++) {
+                        const proxy = this.corsProxies[proxyIndex];
+                        const proxiedUrl = proxy.buildUrl(audioUrlToFetch);
+                        this.loadingText.textContent = `Fetching AI audio via ${proxy.name} (${proxyIndex + 1}/${this.corsProxies.length})...`;
                         
-                        const urlPath = new URL(entry.audio).pathname;
+                        try {
+                            // Add a timeout to fetch requests for proxies
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 seconds timeout
+
+                            const response = await fetch(proxiedUrl, { signal: controller.signal });
+                            clearTimeout(timeoutId);
+
+                            if (response.ok) {
+                                audioBlob = await response.blob();
+                                successfullyFetchedAudio = true;
+                                console.log(`Successfully fetched via ${proxy.name}: ${audioUrlToFetch}`);
+                                break; 
+                            } else {
+                                console.warn(`Proxy ${proxy.name} returned status ${response.status} for ${audioUrlToFetch} (URL: ${proxiedUrl})`);
+                            }
+                        } catch (error) {
+                            console.warn(`Proxy ${proxy.name} failed for ${audioUrlToFetch} (URL: ${proxiedUrl}):`, error);
+                        }
+                    }
+
+                    // If all proxies failed, try a direct fetch (might work if not a CORS issue, or CORS policy changed)
+                    if (!successfullyFetchedAudio) {
+                        this.loadingText.textContent = `Fetching AI audio directly (proxies failed)...`;
+                        console.warn(`All proxies failed for ${audioUrlToFetch}. Attempting direct fetch.`);
+                        try {
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 seconds timeout
+
+                            const response = await fetch(audioUrlToFetch, { signal: controller.signal });
+                            clearTimeout(timeoutId);
+
+                            if (response.ok) {
+                                audioBlob = await response.blob();
+                                successfullyFetchedAudio = true;
+                                console.log(`Successfully fetched directly: ${audioUrlToFetch}`);
+                            } else {
+                                throw new Error(`Direct fetch failed with status ${response.statusText} (URL: ${audioUrlToFetch})`);
+                            }
+                        } catch (directFetchError) {
+                            console.error(`Direct fetch also failed for ${audioUrlToFetch}:`, directFetchError);
+                        }
+                    }
+                    
+                    if (successfullyFetchedAudio && audioBlob) {
+                         // Determine extension from blob type or URL
+                        const urlPath = new URL(audioUrlToFetch).pathname;
                         const extFromUrl = urlPath.substring(urlPath.lastIndexOf('.') + 1);
                         if (['mp3', 'wav', 'ogg', 'aac', 'm4a'].includes(extFromUrl.toLowerCase())) {
                              audioExtension = extFromUrl.toLowerCase();
                         } else if (audioBlob.type && audioBlob.type.startsWith('audio/')) {
                              audioExtension = audioBlob.type.split('/')[1];
-                             if (audioExtension === 'mpeg') audioExtension = 'mp3'; // common case
+                             if (audioExtension === 'mpeg') audioExtension = 'mp3'; // common case for mp3
+                             else if (audioExtension === 'wave' || audioExtension === 'x-wav') audioExtension = 'wav';
                         } else {
-                            audioExtension = 'mp3'; // Fallback for AI audio extension
+                            audioExtension = 'mp3'; // Fallback for AI audio extension if type unknown
                         }
-                    } catch (error) {
-                        console.error(`Failed to fetch audio for ${prefix}:`, error);
-                        zip.file(`${prefix}_audio_FETCH_ERROR.txt`, `Error fetching audio: ${error.message}\nURL: ${entry.audio}`);
-                        continue; 
+                    } else {
+                        console.error(`Failed to fetch audio for ${prefix} from ${audioUrlToFetch} after all attempts.`);
+                        zip.file(`${prefix}_audio_FETCH_ERROR.txt`, `Error fetching audio from: ${audioUrlToFetch}\nAll proxies and direct fetch failed.`);
+                        // Continue to next message in history, audioBlob will be undefined for this one.
                     }
                 }
 
-                if (audioBlob) {
+                if (successfullyFetchedAudio && audioBlob) {
                     zip.file(`${prefix}_audio.${audioExtension}`, audioBlob);
                 }
             }
