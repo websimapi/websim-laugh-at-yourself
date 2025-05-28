@@ -412,7 +412,7 @@ class LaughAtYourselfApp {
     updateConversationHistory(userMessage, userAudioBlob, aiMessage, aiAudioUrl) {
         this.conversationHistory.push(
             { role: 'user', content: userMessage, audio: userAudioBlob },
-            { role: 'assistant', content: aiMessage, audio: aiAudioUrl } // Store URL for AI audio
+            { role: 'assistant', content: aiMessage, audio: aiAudioUrl } 
         );
         
         // Keep only last 20 messages (10 pairs) for performance in UI and storage
@@ -549,7 +549,7 @@ class LaughAtYourselfApp {
                 } else if (entry.role === 'assistant' && typeof entry.audio === 'string') { // AI audio is a URL
                     try {
                         this.loadingText.textContent = `Fetching AI audio ${messageIndex}...`;
-                        const response = await fetch(entry.audio);
+                        const response = await fetch(entry.audio); // Fetch from the stored URL
                         if (!response.ok) throw new Error(`Failed to fetch AI audio: ${response.statusText} (URL: ${entry.audio})`);
                         audioBlob = await response.blob();
                         
